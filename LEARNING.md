@@ -139,3 +139,72 @@ With the default configuration in `model.py`:
 *   **Norms:** ~19K (<0.1%) - Stabilizes training.
 
 This is a **small language model** (comparable to GPT-1 or very small distilled models). It is excellent for learning, experimentation, and running on consumer hardware (even CPUs), but will not match the reasoning capabilities of multi-billion parameter models.
+
+---
+
+## Tokenizer & Vocabulary
+
+You asked: **"What do you think of my tokenizer? Would 32k for Indonesian language sufficient?"**
+
+### Analysis of `otter_tokenizer_id_wiki_32k.json`
+I trained your tokenizer on the Indonesian Wikipedia subset and analyzed its performance.
+
+*   **Vocab Size:** 32,000
+*   **Fertility Rate:** **~1.19 tokens/word** (on sample text)
+    *   *Fertility* measures how many tokens are needed to represent one word on average. Lower is better (1.0 is perfect, meaning 1 word = 1 token).
+    *   **Result:** This is **Excellent**.
+        *   Common words like `Indonesia`, `adalah`, `negara`, `perekonomian` are single tokens.
+        *   Complex words like `diproklamasikan` are split into 3 tokens (`dip`, `roklam`, `asikan`), which is reasonable for a BPE model.
+
+### Is 32k Sufficient?
+**Yes, absolutely.**
+
+*   **Why it works:** Indonesian uses the Latin alphabet and has relatively simple morphology compared to some other languages. 32k is the standard size for Llama 2 (which covers many languages). Since you are focusing on *only* Indonesian (or mostly Indonesian), 32k slots are more than enough to store the vast majority of common Indonesian root words and affixes.
+*   **Trade-off:**
+    *   **32k (Current):**
+        *   **Pros:** Smaller model size (Embeddings are ~24M params). Faster training.
+        *   **Cons:** Very rare words might be split into more subwords.
+    *   **Larger (e.g., 50k+):**
+        *   **Pros:** Might capture even more specific scientific or technical terms as single tokens.
+        *   **Cons:** Increases model size significantly (going to 64k would add ~24M more parameters to the embedding layer and LM head, making the model ~20% larger without adding "intelligence" layers).
+
+**Recommendation:** Stick with **32k**. It strikes the perfect balance between efficiency and coverage for a mono-lingual or bi-lingual Indonesian model of this size (110M params).
+
+---
+
+## How to Make a Small Model (110M) "Smarter"?
+
+You asked: **"I just wondered how to make model with this scale smarter."**
+
+Making a 110M parameter model punch above its weight class requires specific strategies. Models like **Phi-1 (1.3B)** and **TinyLlama (1.1B)** have shown that small models can be surprisingly capable if trained correctly.
+
+### 1. Data Quality is King ("Textbooks Are All You Need")
+The biggest lever you have is **High-Quality Data**.
+*   **The Problem:** Web data (CommonCrawl) is noisy. A small model wastes capacity learning useless patterns (HTML tags, ads, bad grammar).
+*   **The Solution:**
+    *   **Filter Aggressively:** Use only high-quality text (Wikipedia, textbooks, filtered code).
+    *   **Synthetic Data:** Use a large model (GPT-4) to generate "textbook-quality" explanations of concepts.
+    *   **Instruction Tuning:** Train on Q&A pairs, reasoning tasks, and code snippets.
+    *   *Example:* Instead of just reading random sentences, feed it: "Explain photosynthesis to a 5-year-old."
+
+### 2. Over-Training (Beyond Chinchilla)
+Standard scaling laws (Chinchilla) suggest training a 110M model on ~2 Billion tokens.
+*   **The "TinyLlama" Insight:** Small models continue to improve long after this point.
+*   **Strategy:** Train for **10x or 100x longer** (e.g., 20B - 100B tokens). This forces the small model to compress knowledge very efficiently.
+
+### 3. Knowledge Distillation
+Instead of learning from raw text, teach your student (110M) to mimic a teacher (e.g., GPT-4 or Llama-3-70B).
+*   **How:** Get the teacher's output (logits/probabilities) for a text and train your model to match those probabilities (KL Divergence loss), not just the hard text tokens.
+*   **Why:** The teacher provides "soft labels" (e.g., for "The cat sat on the...", the teacher says "mat" (90%) and "rug" (9%)). Learning this distribution provides much more signal than just "mat".
+
+### 4. Curriculum Learning
+Start easy, get harder.
+1.  **Phase 1:** Train on simple, clean text (children's books, simple Wikipedia).
+2.  **Phase 2:** Introduce complex reasoning, code, and scientific papers.
+3.  **Phase 3:** Fine-tune on instructions (Q&A).
+
+### 5. Architectural Tweaks (You already have most!)
+*   ✅ **GQA:** Helps inference speed and context handling.
+*   ✅ **SwiGLU:** Better than ReLU.
+*   ✅ **RoPE:** Better position handling.
+*   **Deep vs. Wide:** Sometimes, a deeper but narrower model (more layers, smaller embedding dim) reasons better than a wide, shallow one. Your current 12-layer config is a good balance.
