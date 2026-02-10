@@ -208,3 +208,34 @@ Start easy, get harder.
 *   ✅ **SwiGLU:** Better than ReLU.
 *   ✅ **RoPE:** Better position handling.
 *   **Deep vs. Wide:** Sometimes, a deeper but narrower model (more layers, smaller embedding dim) reasons better than a wide, shallow one. Your current 12-layer config is a good balance.
+
+---
+
+## Training Time Estimation (Single vs. Dual GPU)
+
+You asked: **"Assume I use your train.py, how long it is in T4x2? Is it single or dual GPU?"**
+
+The updated `train.py` supports **Distributed Data Parallel (DDP)**, meaning it can run on multiple GPUs (e.g., 2x T4s) to speed up training.
+
+### Estimated Training Time (110M Params)
+Assuming we train on **~2.2 Billion tokens** (optimal "Chinchilla" scaling for a 110M model):
+
+| Hardware | Time (approx.) | Notes |
+| :--- | :--- | :--- |
+| **Single T4 GPU** | **~18 Hours** | Baseline. |
+| **Dual T4 GPUs** | **~10 Hours** | Almost 2x faster (scaling efficiency ~90%). |
+
+*Note: These are theoretical estimates based on T4 FLOPs (~65 TFLOPS FP16) and typical utilization (30-40%). Real-world performance depends on data loading speed and thermal throttling.*
+
+### How to Run
+
+**1. Single GPU:**
+```bash
+python3 train.py
+```
+
+**2. Dual GPU (DDP):**
+Use `torchrun` to launch the script on 2 GPUs:
+```bash
+torchrun --standalone --nproc_per_node=2 train.py
+```
