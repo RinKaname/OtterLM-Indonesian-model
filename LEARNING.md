@@ -111,3 +111,31 @@ This class assembles the components.
 *   **Shape Mismatches:** If you change `n_head` or `n_embd`, check the reshape operations in `_attn_block`.
 *   **"Blind" Model:** If the model generates gibberish despite low loss, check the `is_causal` flag in `_attn_block`. It must be `False` during decoding steps with cache.
 *   **OOM (Out of Memory):** Try reducing `block_size` or switching to GQA (reduce `n_kv_head`).
+
+---
+
+## Model Size & "From Scratch"
+
+You asked: **"Is this model from scratch though, how much parameter my model actually?"**
+
+### 1. Is it from scratch?
+**Yes and No.**
+*   **Code:** The *architecture implementation* is written from scratch (though heavily inspired by Llama 2). It defines how the math operations (attention, normalization, etc.) are connected.
+*   **Weights:** The model is initialized with **random weights** (using `_init_weights`). This means it knows nothing about language initially. You must **train it from scratch** on a large dataset (like the Indonesian Wikipedia you have in `tokenizer.py`) for it to generate meaningful text. It is *not* a pre-trained model like GPT-4 or Llama-2-7b that you just download and run.
+
+### 2. How many parameters?
+With the default configuration in `model.py`:
+*   Layers: 12
+*   Heads: 12
+*   Embedding Dim: 768
+*   Vocab Size: 32,000
+
+**Total Trainable Parameters: ~109.5 Million** (110M)
+
+**Breakdown:**
+*   **Embeddings (Input/Output):** ~24.6M (22.4%) - Stores the meaning of each word.
+*   **Attention Layers:** ~28.3M (25.8%) - Captures relationships between words.
+*   **MLP Layers:** ~56.6M (51.7%) - Processes information within each token.
+*   **Norms:** ~19K (<0.1%) - Stabilizes training.
+
+This is a **small language model** (comparable to GPT-1 or very small distilled models). It is excellent for learning, experimentation, and running on consumer hardware (even CPUs), but will not match the reasoning capabilities of multi-billion parameter models.
