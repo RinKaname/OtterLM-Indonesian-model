@@ -11,6 +11,8 @@ class Config:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
+    n_kv_head: int = None
+    dropout: float = 0.0
     rope_theta: float = 10000.0
     norm_eps: float = 1e-6
     use_cache: bool = True
@@ -42,8 +44,10 @@ class OtterLMBlock(nn.Module):
         super().__init__()
         self.config = config
         self.n_head = config.n_head
-        self.n_embd = config.n_embd  # 🔥 FIXED: store n_embd
+        self.n_kv_head = config.n_kv_head if config.n_kv_head is not None else config.n_head
+        self.n_embd = config.n_embd
         self.head_dim = config.n_embd // config.n_head
+        self.n_rep = self.n_head // self.n_kv_head
         
         hidden_dim = int(8 * config.n_embd / 3)
         hidden_dim = ((hidden_dim + 255) // 256) * 256
@@ -51,7 +55,12 @@ class OtterLMBlock(nn.Module):
         self.ln_1 = RMSNorm(config.n_embd, eps=config.norm_eps)
         self.ln_2 = RMSNorm(config.n_embd, eps=config.norm_eps)
         
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
+        # Calculate size for q, k, v projections
+        # q: n_head * head_dim
+        # k: n_kv_head * head_dim
+        # v: n_kv_head * head_dim
+        op_size = (self.n_head + 2 * self.n_kv_head) * self.head_dim
+        self.c_attn = nn.Linear(config.n_embd, op_size, bias=False)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
         
         self.mlp = nn.ModuleDict({
@@ -60,19 +69,26 @@ class OtterLMBlock(nn.Module):
             'down_proj': nn.Linear(hidden_dim, config.n_embd, bias=False),
         })
 
+        self.dropout = nn.Dropout(config.dropout)
+
     def forward(self, x, cos, sin, past_kv=None):
         attn_out, new_kv = self._attn_block(self.ln_1(x), cos, sin, past_kv)
-        x = x + attn_out
-        x = x + self._mlp_block(self.ln_2(x))
+        x = x + self.dropout(attn_out)
+        x = x + self.dropout(self._mlp_block(self.ln_2(x)))
         return x, new_kv
 
     def _attn_block(self, x, cos, sin, past_kv=None):
         B, T, C = x.size()
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)  # ✅ Now works
+        # Split q, k, v
+        q, k, v = self.c_attn(x).split([
+            self.n_head * self.head_dim,
+            self.n_kv_head * self.head_dim,
+            self.n_kv_head * self.head_dim
+        ], dim=2)
         
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
         
         # Apply RoPE BEFORE caching (never re-rotate cached keys)
         q, k = apply_rotary_emb(q, k, cos, sin)
@@ -83,7 +99,16 @@ class OtterLMBlock(nn.Module):
         
         new_kv = (k, v) if self.config.use_cache else None
         
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        # Repeat K/V for GQA to match Q heads
+        if self.n_rep > 1:
+            k = k.repeat_interleave(self.n_rep, dim=1)
+            v = v.repeat_interleave(self.n_rep, dim=1)
+
+        # When decoding with past_kv (T=1), we want to attend to all past keys (is_causal=False).
+        # When training/prefilling (past_kv=None), we need causal masking (is_causal=True).
+        is_causal = past_kv is None
+        dropout_p = self.config.dropout if self.training else 0.0
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal, dropout_p=dropout_p)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.c_proj(y), new_kv
 
