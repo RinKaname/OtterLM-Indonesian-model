@@ -239,3 +239,40 @@ Use `torchrun` to launch the script on 2 GPUs:
 ```bash
 torchrun --standalone --nproc_per_node=2 train.py
 ```
+
+---
+
+## Running on Kaggle Kernels (T4 x2)
+
+You asked: **"Is this possible in Kaggle?"**
+
+**Yes, absolutely.** The `train.py` script is designed to run efficiently on Kaggle's **Dual T4 GPUs**. Here is the step-by-step guide to run it in a Kaggle Notebook:
+
+**1. Setup Environment**
+*   Open a new Notebook.
+*   In the right sidebar, set **Accelerator** to `GPU T4 x2`.
+*   Turn on **Internet Access** (to download the dataset).
+
+**2. Install Dependencies**
+Run this in the first cell:
+```python
+!pip install datasets tokenizers torch --upgrade
+```
+
+**3. Prepare Files**
+Upload `model.py`, `train.py`, and `tokenizer.py` to the Kaggle working directory, or clone your repository.
+
+**4. Train the Tokenizer (Required First)**
+Run this to generate `otter_tokenizer_id_wiki_32k.json`:
+```python
+!python tokenizer.py
+```
+
+**5. Launch Distributed Training**
+Run the training script using `torchrun`. This will automatically use both GPUs to speed up training (~10 hours for 2B tokens).
+```python
+# Adjust max_iters to fit within the 12-hour limit if needed
+!torchrun --standalone --nproc_per_node=2 train.py --batch_size=8 --grad_accum_steps=4 --max_iters=5000
+```
+
+**Tip:** Kaggle has a **12-hour timeout**. The estimated training time is ~10 hours, so it fits! However, you should download `otter_final.pt` or the checkpoints immediately after training finishes to avoid losing them.
