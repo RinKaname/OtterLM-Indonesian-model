@@ -139,3 +139,33 @@ With the default configuration in `model.py`:
 *   **Norms:** ~19K (<0.1%) - Stabilizes training.
 
 This is a **small language model** (comparable to GPT-1 or very small distilled models). It is excellent for learning, experimentation, and running on consumer hardware (even CPUs), but will not match the reasoning capabilities of multi-billion parameter models.
+
+---
+
+## Tokenizer & Vocabulary
+
+You asked: **"What do you think of my tokenizer? Would 32k for Indonesian language sufficient?"**
+
+### Analysis of `otter_tokenizer_id_wiki_32k.json`
+I trained your tokenizer on the Indonesian Wikipedia subset and analyzed its performance.
+
+*   **Vocab Size:** 32,000
+*   **Fertility Rate:** **~1.19 tokens/word** (on sample text)
+    *   *Fertility* measures how many tokens are needed to represent one word on average. Lower is better (1.0 is perfect, meaning 1 word = 1 token).
+    *   **Result:** This is **Excellent**.
+        *   Common words like `Indonesia`, `adalah`, `negara`, `perekonomian` are single tokens.
+        *   Complex words like `diproklamasikan` are split into 3 tokens (`dip`, `roklam`, `asikan`), which is reasonable for a BPE model.
+
+### Is 32k Sufficient?
+**Yes, absolutely.**
+
+*   **Why it works:** Indonesian uses the Latin alphabet and has relatively simple morphology compared to some other languages. 32k is the standard size for Llama 2 (which covers many languages). Since you are focusing on *only* Indonesian (or mostly Indonesian), 32k slots are more than enough to store the vast majority of common Indonesian root words and affixes.
+*   **Trade-off:**
+    *   **32k (Current):**
+        *   **Pros:** Smaller model size (Embeddings are ~24M params). Faster training.
+        *   **Cons:** Very rare words might be split into more subwords.
+    *   **Larger (e.g., 50k+):**
+        *   **Pros:** Might capture even more specific scientific or technical terms as single tokens.
+        *   **Cons:** Increases model size significantly (going to 64k would add ~24M more parameters to the embedding layer and LM head, making the model ~20% larger without adding "intelligence" layers).
+
+**Recommendation:** Stick with **32k**. It strikes the perfect balance between efficiency and coverage for a mono-lingual or bi-lingual Indonesian model of this size (110M params).
