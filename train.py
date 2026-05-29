@@ -171,7 +171,7 @@ def get_lr(it):
     return args.min_lr + coeff * (args.learning_rate - args.min_lr)
 
 # --- 5. Training Loop ---
-scaler = torch.cuda.amp.GradScaler(enabled=True)
+scaler = torch.amp.GradScaler('cuda', enabled=True)
 
 if master_process:
     print(f"Starting training for {args.max_iters} iterations...")
@@ -196,7 +196,7 @@ for iter_num in range(args.max_iters):
 
         X, Y = loader.get_batch()
 
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast('cuda'):
             logits, loss, _ = model(X, targets=Y)
             loss = loss / args.grad_accum_steps
             loss_accum += loss.item() # This is local loss accumulation
