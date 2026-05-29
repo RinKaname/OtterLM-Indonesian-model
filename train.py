@@ -27,6 +27,7 @@ def parse_args():
     parser.add_argument("--warmup_iters", type=int, default=100, help="Linear warmup steps")
     parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay for AdamW")
     parser.add_argument("--compile", action="store_true", help="Use torch.compile")
+    parser.add_argument("--resume", type=str, default="", help="Path to checkpoint .pt file to resume from")
     parser.add_argument("--tokenizer_path", type=str, default="otter_tokenizer_id_wiki_32k.json")
     return parser.parse_args()
 
@@ -124,6 +125,18 @@ config = Config(
 )
 model = OtterLM(config)
 model.to(device)
+if args.resume:
+    print(f"Loading checkpoint from {args.resume}...")
+    checkpoint = torch.load(args.resume, map_location=device)
+    # Depending on how it was saved, it might be raw state_dict or nested
+    state_dict = checkpoint.get('model', checkpoint)
+    # Remove '_orig_mod.' prefix if saved from a compiled model
+    unwanted_prefix = '_orig_mod.'
+    for k,v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+    model.load_state_dict(state_dict)
+    print("Successfully loaded model weights.")
 
 if args.compile and hasattr(torch, "compile"):
     if master_process: print("Compiling model...")
