@@ -3,6 +3,7 @@ import time
 import math
 import argparse
 import torch
+from safetensors.torch import save_file
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.distributed import init_process_group, destroy_process_group
@@ -219,5 +220,5 @@ if ddp:
 
 if master_process:
     print("Training complete!")
-    torch.save(raw_model.state_dict(), "otter_final.pt")
-    print("Model saved to otter_final.pt")
+    save_file(raw_model.state_dict(), "otter_final.safetensors")
+    print("Model saved to otter_final.safetensors")
