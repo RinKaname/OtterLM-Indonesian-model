@@ -3,6 +3,7 @@ import time
 import math
 import argparse
 import torch
+from safetensors.torch import save_file
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.distributed import init_process_group, destroy_process_group
@@ -26,6 +27,7 @@ def parse_args():
     parser.add_argument("--warmup_iters", type=int, default=100, help="Linear warmup steps")
     parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay for AdamW")
     parser.add_argument("--compile", action="store_true", help="Use torch.compile")
+    parser.add_argument("--resume", type=str, default="", help="Path to checkpoint .pt file to resume from")
     parser.add_argument("--tokenizer_path", type=str, default="otter_tokenizer_id_wiki_32k.json")
     return parser.parse_args()
 
@@ -124,18 +126,11 @@ config = Config(
 model = OtterLM(config)
 model.to(device)
 
-if args.compile and hasattr(torch, "compile"):
-    if master_process: print("Compiling model...")
-    model = torch.compile(model)
-
-if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
-
-raw_model = model.module if ddp else model # unwrap DDP container
+# --- 4. Optimizer & Scheduler ---
+raw_model = model # Base model before compile/DDP
 if master_process:
     print(f"Model Parameters: {sum(p.numel() for p in raw_model.parameters())/1e6:.1f}M")
 
-# --- 4. Optimizer & Scheduler ---
 # We use weight decay only on 2D parameters (weights), not biases or norms.
 param_dict = {pn: p for pn, p in raw_model.named_parameters() if p.requires_grad}
 decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
@@ -156,16 +151,49 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return args.min_lr + coeff * (args.learning_rate - args.min_lr)
 
-# --- 5. Training Loop ---
-scaler = torch.cuda.amp.GradScaler(enabled=True)
+scaler = torch.amp.GradScaler('cuda', enabled=True)
 
+start_iter = 0
+
+if args.resume:
+    if master_process:
+        print(f"Loading checkpoint from {args.resume}...")
+    checkpoint = torch.load(args.resume, map_location=device)
+    state_dict = checkpoint.get('model', checkpoint)
+    unwanted_prefix = '_orig_mod.'
+    for k,v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+
+    # Needs unwrapped model
+    raw_model.load_state_dict(state_dict)
+
+    if 'optimizer' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer'])
+    if 'scaler' in checkpoint:
+        scaler.load_state_dict(checkpoint['scaler'])
+    if 'iter_num' in checkpoint:
+        start_iter = checkpoint['iter_num'] + 1
+        if master_process:
+            print(f"Resuming from iteration {start_iter}")
+    if master_process:
+        print("Successfully loaded checkpoint.")
+
+if args.compile and hasattr(torch, "compile"):
+    if master_process: print("Compiling model...")
+    model = torch.compile(model)
+
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+
+# --- 5. Training Loop ---
 if master_process:
     print(f"Starting training for {args.max_iters} iterations...")
 
 model.train()
 t0 = time.time()
 
-for iter_num in range(args.max_iters):
+for iter_num in range(start_iter, args.max_iters):
     # Determine LR
     lr = get_lr(iter_num)
     for param_group in optimizer.param_groups:
@@ -182,7 +210,7 @@ for iter_num in range(args.max_iters):
 
         X, Y = loader.get_batch()
 
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast('cuda'):
             logits, loss, _ = model(X, targets=Y)
             loss = loss / args.grad_accum_steps
             loss_accum += loss.item() # This is local loss accumulation
@@ -203,8 +231,6 @@ for iter_num in range(args.max_iters):
         dt = (t1 - t0) * 1000 # ms
         t0 = t1
 
-        # In DDP, we might want to average loss across ranks for logging,
-        # but printing rank 0 loss is often good enough for monitoring.
         if master_process:
             print(f"step {iter_num:5d} | loss {loss_accum:.4f} | lr {lr:.2e} | time {dt:.2f}ms")
 
@@ -212,12 +238,22 @@ for iter_num in range(args.max_iters):
     if master_process and iter_num > 0 and iter_num % args.save_interval == 0:
         checkpoint_path = f"otter_ckpt_{iter_num}.pt"
         print(f"Saving checkpoint to {checkpoint_path}")
-        torch.save(raw_model.state_dict(), checkpoint_path)
+        checkpoint_dict = {
+            'model': raw_model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scaler': scaler.state_dict(),
+            'iter_num': iter_num
+        }
+        torch.save(checkpoint_dict, checkpoint_path)
 
 if ddp:
     destroy_process_group()
 
 if master_process:
     print("Training complete!")
-    torch.save(raw_model.state_dict(), "otter_final.pt")
-    print("Model saved to otter_final.pt")
+    state_dict = raw_model.state_dict()
+    # Clone shared tensors for safetensors compatibility
+    for k, v in state_dict.items():
+        state_dict[k] = v.clone()
+    save_file(state_dict, "otter_final.safetensors")
+    print("Model saved to otter_final.safetensors")
