@@ -34,7 +34,7 @@ def parse_args():
 args = parse_args()
 
 # DDP Configuration
-ddp = int(os.environ.get("RANK", -1)) != -1 # Is this a DDP run?
+ddp = int(os.environ.get("RANK", -1)) != -1
 if ddp:
     init_process_group(backend="nccl")
     ddp_rank = int(os.environ["RANK"])
@@ -42,10 +42,9 @@ if ddp:
     ddp_world_size = int(os.environ["WORLD_SIZE"])
     device = f"cuda:{ddp_local_rank}"
     torch.cuda.set_device(device)
-    master_process = ddp_rank == 0 # logging only on master
-    seed_offset = ddp_rank # ensure different random seed per process
+    master_process = ddp_rank == 0
+    seed_offset = ddp_rank
 else:
-    # Vanilla single-GPU/CPU run
     ddp_rank = 0
     ddp_local_rank = 0
     ddp_world_size = 1
@@ -57,32 +56,53 @@ if master_process:
     print(f"Using device: {device} (World Size: {ddp_world_size})")
 
 torch.manual_seed(1337 + seed_offset)
-torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on ampere
+torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-# --- 2. Data Loader (Streaming) ---
+# --- 2. Checkpoint Pre-load (to get start_iter for Dataset skip) ---
+start_iter = 0
+checkpoint = None
+if args.resume:
+    if master_process:
+        print(f"Loading checkpoint from {args.resume}...")
+    checkpoint = torch.load(args.resume, map_location=device)
+    if 'iter_num' in checkpoint:
+        start_iter = checkpoint['iter_num'] + 1
+        if master_process:
+            print(f"Resuming from iteration {start_iter}")
+
+# --- 3. Data Loader (Streaming with Fast-Forward) ---
 if master_process:
     print("Loading dataset (streaming)...")
 
-# Each rank loads the dataset, but we shuffle differently to ensure different batches
 raw_dataset = load_dataset("HuggingFaceFW/finewiki", name="id", split="train", streaming=True)
 raw_dataset = raw_dataset.shuffle(buffer_size=10000, seed=42 + seed_offset)
 
-# Load Tokenizer
 if not os.path.exists(args.tokenizer_path):
     raise FileNotFoundError(f"Tokenizer not found at {args.tokenizer_path}. Run tokenizer.py first!")
 tokenizer = Tokenizer.from_file(args.tokenizer_path)
 vocab_size = tokenizer.get_vocab_size()
 
 class SmartLoader:
-    def __init__(self, dataset, tokenizer, batch_size, block_size, device):
+    def __init__(self, dataset, tokenizer, batch_size, block_size, device, start_iter=0, grad_accum=1):
         self.dataset = dataset
-        self.iterator = iter(dataset)
         self.tokenizer = tokenizer
         self.batch_size = batch_size
         self.block_size = block_size
-        self.buffer = []
         self.device = device
+
+        # Calculate how many tokens we processed in previous runs
+        tokens_per_batch = batch_size * (block_size + 1)
+        total_tokens_processed = start_iter * grad_accum * tokens_per_batch
+
+        # Estimate how many documents to skip (average ~500 tokens per wiki doc)
+        docs_to_skip = int(total_tokens_processed / 500)
+
+        if docs_to_skip > 0 and master_process:
+            print(f"Fast-forwarding dataset... Skipping approx {docs_to_skip} documents from previous runs.")
+
+        self.iterator = iter(self.dataset.skip(docs_to_skip))
+        self.buffer = []
 
     def get_batch(self):
         tokens_per_seq = self.block_size + 1
@@ -112,9 +132,9 @@ class SmartLoader:
         y = data[:, 1:].contiguous().to(self.device)
         return x, y
 
-loader = SmartLoader(raw_dataset, tokenizer, args.batch_size, args.block_size, device)
+loader = SmartLoader(raw_dataset, tokenizer, args.batch_size, args.block_size, device, start_iter, args.grad_accum_steps)
 
-# --- 3. Model Initialization ---
+# --- 4. Model Initialization ---
 config = Config(
     vocab_size=vocab_size,
     block_size=args.block_size,
@@ -126,12 +146,30 @@ config = Config(
 model = OtterLM(config)
 model.to(device)
 
-# --- 4. Optimizer & Scheduler ---
-raw_model = model # Base model before compile/DDP
+raw_model = model
+
+# Restore weights if resuming
+if checkpoint is not None:
+    state_dict = checkpoint.get('model', checkpoint)
+    unwanted_prefix = '_orig_mod.'
+    for k,v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+    raw_model.load_state_dict(state_dict)
+    if master_process:
+        print("Successfully loaded model weights.")
+
+if args.compile and hasattr(torch, "compile"):
+    if master_process: print("Compiling model...")
+    model = torch.compile(model)
+
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+
 if master_process:
     print(f"Model Parameters: {sum(p.numel() for p in raw_model.parameters())/1e6:.1f}M")
 
-# We use weight decay only on 2D parameters (weights), not biases or norms.
+# --- 5. Optimizer & Scheduler ---
 param_dict = {pn: p for pn, p in raw_model.named_parameters() if p.requires_grad}
 decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
 nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
@@ -141,7 +179,14 @@ optim_groups = [
 ]
 optimizer = torch.optim.AdamW(optim_groups, lr=args.learning_rate, betas=(0.9, 0.95))
 
-# Cosine Learning Rate Schedule
+scaler = torch.amp.GradScaler('cuda', enabled=True)
+
+if checkpoint is not None:
+    if 'optimizer' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer'])
+    if 'scaler' in checkpoint:
+        scaler.load_state_dict(checkpoint['scaler'])
+
 def get_lr(it):
     if it < args.warmup_iters:
         return args.learning_rate * it / args.warmup_iters
@@ -151,42 +196,7 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return args.min_lr + coeff * (args.learning_rate - args.min_lr)
 
-scaler = torch.amp.GradScaler('cuda', enabled=True)
-
-start_iter = 0
-
-if args.resume:
-    if master_process:
-        print(f"Loading checkpoint from {args.resume}...")
-    checkpoint = torch.load(args.resume, map_location=device)
-    state_dict = checkpoint.get('model', checkpoint)
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-
-    # Needs unwrapped model
-    raw_model.load_state_dict(state_dict)
-
-    if 'optimizer' in checkpoint:
-        optimizer.load_state_dict(checkpoint['optimizer'])
-    if 'scaler' in checkpoint:
-        scaler.load_state_dict(checkpoint['scaler'])
-    if 'iter_num' in checkpoint:
-        start_iter = checkpoint['iter_num'] + 1
-        if master_process:
-            print(f"Resuming from iteration {start_iter}")
-    if master_process:
-        print("Successfully loaded checkpoint.")
-
-if args.compile and hasattr(torch, "compile"):
-    if master_process: print("Compiling model...")
-    model = torch.compile(model)
-
-if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
-
-# --- 5. Training Loop ---
+# --- 6. Training Loop ---
 if master_process:
     print(f"Starting training for {args.max_iters} iterations...")
 
@@ -194,17 +204,14 @@ model.train()
 t0 = time.time()
 
 for iter_num in range(start_iter, args.max_iters):
-    # Determine LR
     lr = get_lr(iter_num)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
-    # Forward/Backward
     optimizer.zero_grad(set_to_none=True)
     loss_accum = 0.0
 
     for micro_step in range(args.grad_accum_steps):
-        # In DDP, only sync gradients on the last micro-step
         if ddp:
             model.require_backward_grad_sync = (micro_step == args.grad_accum_steps - 1)
 
@@ -213,28 +220,24 @@ for iter_num in range(start_iter, args.max_iters):
         with torch.amp.autocast('cuda'):
             logits, loss, _ = model(X, targets=Y)
             loss = loss / args.grad_accum_steps
-            loss_accum += loss.item() # This is local loss accumulation
+            loss_accum += loss.item()
 
         scaler.scale(loss).backward()
 
-    # Clip Gradients
     scaler.unscale_(optimizer)
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
-    # Step
     scaler.step(optimizer)
     scaler.update()
 
-    # Logging
     if iter_num % 10 == 0:
         t1 = time.time()
-        dt = (t1 - t0) * 1000 # ms
+        dt = (t1 - t0) * 1000
         t0 = t1
 
         if master_process:
             print(f"step {iter_num:5d} | loss {loss_accum:.4f} | lr {lr:.2e} | time {dt:.2f}ms")
 
-    # Checkpointing (only on master)
     if master_process and iter_num > 0 and iter_num % args.save_interval == 0:
         checkpoint_path = f"otter_ckpt_{iter_num}.pt"
         print(f"Saving checkpoint to {checkpoint_path}")
@@ -252,7 +255,6 @@ if ddp:
 if master_process:
     print("Training complete!")
     state_dict = raw_model.state_dict()
-    # Clone shared tensors for safetensors compatibility
     for k, v in state_dict.items():
         state_dict[k] = v.clone()
     save_file(state_dict, "otter_final.safetensors")
